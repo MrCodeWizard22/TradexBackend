@@ -20,8 +20,6 @@ import jakarta.persistence.OneToOne;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.CascadeType;
 
-
-
 @Entity
 @Table(name = "users")
 @Getter
@@ -44,6 +42,8 @@ public class User {
     private Role role;
     private Date createdAt;
     private Date updatedAt;
+
+    private boolean isVerified;
 
     @OneToOne(cascade = CascadeType.ALL)
     @JoinColumn(name = "wallet_id")
