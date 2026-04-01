@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.piyush.tradex.dto.AddMoneyRequestDTO;
+import com.piyush.tradex.dto.DeductMoneyRequestDTO;
 import com.piyush.tradex.dto.WalletResponseDTO;
 import com.piyush.tradex.service.WalletService;
 
@@ -25,12 +26,6 @@ public class WalletController {
     @Autowired
     private WalletService walletService;
 
-    /**
-     * POST /api/wallet/add
-     * Adds money to the authenticated user's wallet.
-     * Requires: Authorization: Bearer <jwt-token>
-     * Body: { "amount": 500.0 }
-     */
     @PostMapping("/add")
     public ResponseEntity<WalletResponseDTO> addMoney(@Valid @RequestBody AddMoneyRequestDTO request) {
         String email = getAuthenticatedEmail();
@@ -38,11 +33,13 @@ public class WalletController {
         return ResponseEntity.ok(response);
     }
 
-    /**
-     * GET /api/wallet/balance
-     * Returns the current wallet balance of the authenticated user.
-     * Requires: Authorization: Bearer <jwt-token>
-     */
+    @PostMapping("/deduct")
+    public ResponseEntity<WalletResponseDTO> deductMoney(@Valid @RequestBody DeductMoneyRequestDTO request) {
+        String email = getAuthenticatedEmail();
+        WalletResponseDTO response = walletService.deductMoney(email, request);
+        return ResponseEntity.ok(response);
+    }
+
     @GetMapping("/balance")
     public ResponseEntity<WalletResponseDTO> getBalance() {
         String email = getAuthenticatedEmail();
