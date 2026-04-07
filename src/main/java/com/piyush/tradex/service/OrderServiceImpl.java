@@ -2,6 +2,7 @@ package com.piyush.tradex.service;
 
 import java.util.Date;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -31,106 +32,210 @@ public class OrderServiceImpl implements OrderService {
     @Autowired
     private OrderRepository orderRepository;
 
+    // BUY
+
     @Override
     @Transactional
     public OrderResponseDTO buyStock(String email, OrderRequestDTO request) {
-        User user = userRepository.findByEmail(email);
-        if (user == null) {
-            throw new RuntimeException("User not found with email: " + email);
+
+        // 1. Resolve user
+        User buyer = userRepository.findByEmail(email);
+        if (buyer == null) {
+            throw new RuntimeException("User not found: " + email);
         }
 
-        Wallet wallet = user.getWallet();
-        if (wallet == null) {
+        // 2. Wallet check and deduction
+        Wallet buyerWallet = buyer.getWallet();
+        if (buyerWallet == null) {
             throw new RuntimeException("Wallet not found for user: " + email);
         }
 
         double totalValue = request.getPrice() * request.getQuantity();
 
-        if (wallet.getBalance() < totalValue) {
+        if (buyerWallet.getBalance() < totalValue) {
             throw new RuntimeException(
-                "Insufficient balance. Required: ₹" + totalValue + ", Available: ₹" + wallet.getBalance()
-            );
+                    "Insufficient balance. Required: ₹" + totalValue +
+                            ", Available: ₹" + buyerWallet.getBalance());
         }
 
-        // Deduct from wallet
-        wallet.setBalance(wallet.getBalance() - totalValue);
-        walletRepository.save(wallet);
+        // Deduct money upfront (held against the BUY order)
+        buyerWallet.setBalance(buyerWallet.getBalance() - totalValue);
+        walletRepository.save(buyerWallet);
 
-        // Store order
-        Order order = new Order();
-        order.setUser(user);
-        order.setOrderType(OrderType.BUY);
-        order.setPrice(request.getPrice());
-        order.setQuantity(request.getQuantity());
-        order.setStatus(OrderStatus.EXECUTED);
-        order.setCreatedAt(new Date());
-        orderRepository.save(order);
+        // 3. Save BUY order as PENDING
+        Order buyOrder = new Order();
+        buyOrder.setUser(buyer);
+        buyOrder.setOrderType(OrderType.BUY);
+        buyOrder.setPrice(request.getPrice());
+        buyOrder.setQuantity(request.getQuantity());
+        buyOrder.setStatus(OrderStatus.PENDING);
+        buyOrder.setCreatedAt(new Date());
+        orderRepository.save(buyOrder);
+
+        // 4. Try to match with a PENDING SELL order
+        boolean matched = matchOrder(buyOrder);
+
+        // Re-read wallet balance after potential match
+        double currentBalance = walletRepository.findById(buyerWallet.getWalletId())
+                .map(w -> w.getBalance())
+                .orElse(buyerWallet.getBalance());
+
+        String message = matched
+                ? "BUY order EXECUTED! Matched with a SELL order. ₹" + totalValue + " deducted."
+                : "BUY order placed and is PENDING. ₹" + totalValue + " reserved. Waiting for a matching SELL.";
 
         return new OrderResponseDTO(
-            order.getOrderId(),
-            user.getUserId(),
-            OrderType.BUY,
-            request.getPrice(),
-            request.getQuantity(),
-            totalValue,
-            OrderStatus.EXECUTED,
-            "BUY order placed successfully. ₹" + totalValue + " deducted.",
-            wallet.getBalance()
-        );
+                buyOrder.getOrderId(),
+                buyer.getUserId(),
+                OrderType.BUY,
+                request.getPrice(),
+                request.getQuantity(),
+                totalValue,
+                buyOrder.getStatus(),
+                message,
+                currentBalance);
     }
+
+    // SELL
 
     @Override
     @Transactional
     public OrderResponseDTO sellStock(String email, OrderRequestDTO request) {
-        User user = userRepository.findByEmail(email);
-        if (user == null) {
-            throw new RuntimeException("User not found with email: " + email);
+
+        // 1. Resolve user
+        User seller = userRepository.findByEmail(email);
+        if (seller == null) {
+            throw new RuntimeException("User not found: " + email);
         }
 
         double totalValue = request.getPrice() * request.getQuantity();
 
-        // Store order (no wallet change for now)
-        Order order = new Order();
-        order.setUser(user);
-        order.setOrderType(OrderType.SELL);
-        order.setPrice(request.getPrice());
-        order.setQuantity(request.getQuantity());
-        order.setStatus(OrderStatus.EXECUTED);
-        order.setCreatedAt(new Date());
-        orderRepository.save(order);
+        // 2. Save SELL order as PENDING
+        Order sellOrder = new Order();
+        sellOrder.setUser(seller);
+        sellOrder.setOrderType(OrderType.SELL);
+        sellOrder.setPrice(request.getPrice());
+        sellOrder.setQuantity(request.getQuantity());
+        sellOrder.setStatus(OrderStatus.PENDING);
+        sellOrder.setCreatedAt(new Date());
+        orderRepository.save(sellOrder);
+
+        // 3. Try to match with a PENDING BUY order
+        boolean matched = matchOrder(sellOrder);
+
+        // Re-read seller wallet balance
+        Double newBalance = null;
+        if (matched && seller.getWallet() != null) {
+            newBalance = walletRepository.findById(seller.getWallet().getWalletId())
+                    .map(w -> w.getBalance())
+                    .orElse(null);
+        }
+
+        String message = matched
+                ? "SELL order EXECUTED! Matched with a BUY order. ₹" + totalValue + " credited to your wallet."
+                : "SELL order placed and is PENDING. Waiting for a matching BUY order.";
 
         return new OrderResponseDTO(
-            order.getOrderId(),
-            user.getUserId(),
-            OrderType.SELL,
-            request.getPrice(),
-            request.getQuantity(),
-            totalValue,
-            OrderStatus.EXECUTED,
-            "SELL order placed successfully.",
-            null
-        );
+                sellOrder.getOrderId(),
+                seller.getUserId(),
+                OrderType.SELL,
+                request.getPrice(),
+                request.getQuantity(),
+                totalValue,
+                sellOrder.getStatus(),
+                message,
+                newBalance);
     }
+
+    // MATCHING ENGINE (core logic)
+
+    /**
+     * Matching rules:
+     * - Exact price match
+     * - Exact quantity match
+     * - Opposite order type (BUY ↔ SELL)
+     * - Both must be PENDING
+     *
+     * On match:
+     * 1. Both orders → EXECUTED
+     * 2. Seller's wallet is credited
+     * 3. Buyer's wallet was already debited at order placement
+     *
+     * @return true if a match was found and executed, false otherwise
+     */
+    @Transactional
+    private boolean matchOrder(Order incomingOrder) {
+
+        // Determine what type of opposite order we need
+        OrderType oppositeType = (incomingOrder.getOrderType() == OrderType.BUY)
+                ? OrderType.SELL
+                : OrderType.BUY;
+
+        // Search for the earliest matching opposite PENDING order
+        List<Order> matchOpt = orderRepository.findFirstMatchingOrders(
+                oppositeType,
+                incomingOrder.getPrice(),
+                incomingOrder.getQuantity(),
+                OrderStatus.PENDING);
+        if(matchOpt == null || matchOpt.isEmpty()) {
+            return false;
+        }
+        Optional<Order> optionalMatch = Optional.empty();
+        for (Order o : matchOpt) {
+            if(o.getUser().getUserId() != incomingOrder.getUser().getUserId() && o.getOrderId() != incomingOrder.getOrderId()) {
+                optionalMatch = Optional.of(o);
+                break;
+            }
+        }
+        if(optionalMatch == null || optionalMatch.isEmpty()) {
+            return false;
+        }
+        Order matchedOrder = optionalMatch.get();
+
+        // Mark both orders as EXECUTED
+        incomingOrder.setStatus(OrderStatus.EXECUTED);
+        matchedOrder.setStatus(OrderStatus.EXECUTED);
+        orderRepository.save(incomingOrder);
+        orderRepository.save(matchedOrder);
+
+        // Credit the seller
+        // Identify who is the seller
+        Order sellOrder = (incomingOrder.getOrderType() == OrderType.SELL)
+                ? incomingOrder
+                : matchedOrder;
+
+        User seller = sellOrder.getUser();
+        double tradeValue = sellOrder.getPrice() * sellOrder.getQuantity();
+
+        Wallet sellerWallet = seller.getWallet();
+        if (sellerWallet != null) {
+            sellerWallet.setBalance(sellerWallet.getBalance() + tradeValue);
+            walletRepository.save(sellerWallet);
+        }
+
+        return true;
+    }
+
+    // ORDER HISTORY
 
     @Override
     public List<OrderResponseDTO> getOrderHistory(String email) {
         User user = userRepository.findByEmail(email);
         if (user == null) {
-            throw new RuntimeException("User not found with email: " + email);
+            throw new RuntimeException("User not found: " + email);
         }
 
         List<Order> orders = orderRepository.findByUser(user);
 
         return orders.stream().map(order -> new OrderResponseDTO(
-            order.getOrderId(),
-            user.getUserId(),
-            order.getOrderType(),
-            order.getPrice(),
-            order.getQuantity(),
-            order.getPrice() * order.getQuantity(),
-            order.getStatus(),
-            order.getOrderType() + " order on " + order.getCreatedAt(),
-            null
-        )).collect(Collectors.toList());
+                order.getOrderId(),
+                user.getUserId(),
+                order.getOrderType(),
+                order.getPrice(),
+                order.getQuantity(),
+                order.getPrice() * order.getQuantity(),
+                order.getStatus(),
+                order.getOrderType() + " order — " + order.getStatus() + " | " + order.getCreatedAt(),
+                null)).collect(Collectors.toList());
     }
 }

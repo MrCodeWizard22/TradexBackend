@@ -13,11 +13,11 @@ public class OrderResponseDTO {
     private double totalValue;
     private OrderStatus status;
     private String message;
-    private Double newWalletBalance; // populated for BUY, null for SELL
+    private Double newWalletBalance;
 
     public OrderResponseDTO(long orderId, long userId, OrderType orderType,
-                            double price, int quantity, double totalValue,
-                            OrderStatus status, String message, Double newWalletBalance) {
+            double price, int quantity, double totalValue,
+            OrderStatus status, String message, Double newWalletBalance) {
         this.orderId = orderId;
         this.userId = userId;
         this.orderType = orderType;
@@ -29,13 +29,39 @@ public class OrderResponseDTO {
         this.newWalletBalance = newWalletBalance;
     }
 
-    public long getOrderId() { return orderId; }
-    public long getUserId() { return userId; }
-    public OrderType getOrderType() { return orderType; }
-    public double getPrice() { return price; }
-    public int getQuantity() { return quantity; }
-    public double getTotalValue() { return totalValue; }
-    public OrderStatus getStatus() { return status; }
-    public String getMessage() { return message; }
-    public Double getNewWalletBalance() { return newWalletBalance; }
+    public long getOrderId() {
+        return orderId;
+    }
+
+    public long getUserId() {
+        return userId;
+    }
+
+    public OrderType getOrderType() {
+        return orderType;
+    }
+
+    public double getPrice() {
+        return price;
+    }
+
+    public int getQuantity() {
+        return quantity;
+    }
+
+    public double getTotalValue() {
+        return totalValue;
+    }
+
+    public OrderStatus getStatus() {
+        return status;
+    }
+
+    public String getMessage() {
+        return message;
+    }
+
+    public Double getNewWalletBalance() {
+        return newWalletBalance;
+    }
 }
