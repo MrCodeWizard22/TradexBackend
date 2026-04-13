@@ -11,11 +11,13 @@ import org.springframework.transaction.annotation.Transactional;
 
 import com.piyush.tradex.dto.OrderRequestDTO;
 import com.piyush.tradex.dto.OrderResponseDTO;
+import com.piyush.tradex.enitity.Holding;
 import com.piyush.tradex.enitity.Order;
 import com.piyush.tradex.enitity.User;
 import com.piyush.tradex.enitity.Wallet;
 import com.piyush.tradex.enums.OrderStatus;
 import com.piyush.tradex.enums.OrderType;
+import com.piyush.tradex.repository.HoldingRepository;
 import com.piyush.tradex.repository.OrderRepository;
 import com.piyush.tradex.repository.UserRepository;
 import com.piyush.tradex.repository.WalletRepository;
@@ -31,6 +33,9 @@ public class OrderServiceImpl implements OrderService {
 
     @Autowired
     private OrderRepository orderRepository;
+
+    @Autowired
+    private HoldingRepository holdingRepository;
 
     // BUY
 
@@ -108,9 +113,21 @@ public class OrderServiceImpl implements OrderService {
             throw new RuntimeException("User not found: " + email);
         }
 
+        // 2. Validate holding BEFORE creating the order
+        Optional<Holding> sellerHoldingOpt = holdingRepository.findByUser(seller);
+        if (sellerHoldingOpt.isEmpty()) {
+            throw new RuntimeException("Cannot sell: you have no holdings.");
+        }
+        Holding sellerHolding = sellerHoldingOpt.get();
+        if (sellerHolding.getQuantity() < request.getQuantity()) {
+            throw new RuntimeException(
+                    "Cannot sell: insufficient holding. You have " + sellerHolding.getQuantity() +
+                            " unit(s) but tried to sell " + request.getQuantity() + ".");
+        }
+
         double totalValue = request.getPrice() * request.getQuantity();
 
-        // 2. Save SELL order as PENDING
+        // 3. Save SELL order as PENDING
         Order sellOrder = new Order();
         sellOrder.setUser(seller);
         sellOrder.setOrderType(OrderType.SELL);
@@ -120,7 +137,7 @@ public class OrderServiceImpl implements OrderService {
         sellOrder.setCreatedAt(new Date());
         orderRepository.save(sellOrder);
 
-        // 3. Try to match with a PENDING BUY order
+        // Try to match with a PENDING BUY order
         boolean matched = matchOrder(sellOrder);
 
         // Re-read seller wallet balance
@@ -149,22 +166,7 @@ public class OrderServiceImpl implements OrderService {
 
     // MATCHING ENGINE (core logic)
 
-    /**
-     * Matching rules:
-     * - Exact price match
-     * - Exact quantity match
-     * - Opposite order type (BUY ↔ SELL)
-     * - Both must be PENDING
-     *
-     * On match:
-     * 1. Both orders → EXECUTED
-     * 2. Seller's wallet is credited
-     * 3. Buyer's wallet was already debited at order placement
-     *
-     * @return true if a match was found and executed, false otherwise
-     */
-    @Transactional
-    private boolean matchOrder(Order incomingOrder) {
+    boolean matchOrder(Order incomingOrder) {
 
         // Determine what type of opposite order we need
         OrderType oppositeType = (incomingOrder.getOrderType() == OrderType.BUY)
@@ -177,17 +179,31 @@ public class OrderServiceImpl implements OrderService {
                 incomingOrder.getPrice(),
                 incomingOrder.getQuantity(),
                 OrderStatus.PENDING);
-        if(matchOpt == null || matchOpt.isEmpty()) {
+        if (matchOpt == null || matchOpt.isEmpty()) {
             return false;
         }
         Optional<Order> optionalMatch = Optional.empty();
+
         for (Order o : matchOpt) {
-            if(o.getUser().getUserId() != incomingOrder.getUser().getUserId() && o.getOrderId() != incomingOrder.getOrderId()) {
-                optionalMatch = Optional.of(o);
-                break;
+
+            if (Long.compare(o.getUser().getUserId(), incomingOrder.getUser().getUserId()) == 0
+                    || Long.compare(o.getOrderId(), incomingOrder.getOrderId()) == 0) {
+                continue;
             }
+
+            Order sellCandidate = (o.getOrderType() == OrderType.SELL) ? o : incomingOrder;
+
+            User seller = sellCandidate.getUser();
+            Optional<Holding> holdingOpt = holdingRepository.findByUser(seller);
+
+            if (holdingOpt.isEmpty() || holdingOpt.get().getQuantity() < sellCandidate.getQuantity()) {
+                continue;
+            }
+
+            optionalMatch = Optional.of(o);
+            break;
         }
-        if(optionalMatch == null || optionalMatch.isEmpty()) {
+        if (optionalMatch.isEmpty()) {
             return false;
         }
         Order matchedOrder = optionalMatch.get();
@@ -198,19 +214,59 @@ public class OrderServiceImpl implements OrderService {
         orderRepository.save(incomingOrder);
         orderRepository.save(matchedOrder);
 
-        // Credit the seller
-        // Identify who is the seller
+        // Identify buyer and seller
         Order sellOrder = (incomingOrder.getOrderType() == OrderType.SELL)
+                ? incomingOrder
+                : matchedOrder;
+        Order buyOrder = (incomingOrder.getOrderType() == OrderType.BUY)
                 ? incomingOrder
                 : matchedOrder;
 
         User seller = sellOrder.getUser();
+        User buyer = buyOrder.getUser();
         double tradeValue = sellOrder.getPrice() * sellOrder.getQuantity();
+        int tradeQty = sellOrder.getQuantity();
+        double tradePrice = sellOrder.getPrice();
 
+        // ── Credit the seller's wallet ──────────────────────────────────────
         Wallet sellerWallet = seller.getWallet();
         if (sellerWallet != null) {
             sellerWallet.setBalance(sellerWallet.getBalance() + tradeValue);
             walletRepository.save(sellerWallet);
+        }
+
+        // ── Update BUYER holding ────────────────────────────────────────────
+        Optional<Holding> buyerHoldingOpt = holdingRepository.findByUser(buyer);
+        if (buyerHoldingOpt.isEmpty()) {
+            // Case 1: no holding yet — create it
+            Holding newHolding = new Holding();
+            newHolding.setUser(buyer);
+            newHolding.setQuantity(tradeQty);
+            newHolding.setAveragePrice(tradePrice);
+            holdingRepository.save(newHolding);
+        } else {
+            // Case 2: holding exists — recalculate average price
+            Holding buyerHolding = buyerHoldingOpt.get();
+            int oldQty = buyerHolding.getQuantity();
+            double oldAvgPrice = buyerHolding.getAveragePrice();
+            int newQty = oldQty + tradeQty;
+            double newAvgPrice = (oldQty * oldAvgPrice + tradeQty * tradePrice) / newQty;
+            buyerHolding.setQuantity(newQty);
+            buyerHolding.setAveragePrice(newAvgPrice);
+            holdingRepository.save(buyerHolding);
+        }
+
+        // ── Update SELLER holding ───────────────────────────────────────────
+        Optional<Holding> sellerHoldingOpt = holdingRepository.findByUser(seller);
+        if (sellerHoldingOpt.isPresent()) {
+            Holding sellerHolding = sellerHoldingOpt.get();
+            int newQty = sellerHolding.getQuantity() - tradeQty;
+            if (newQty == 0) {
+                holdingRepository.delete(sellerHolding);
+            } else {
+                sellerHolding.setQuantity(newQty);
+                holdingRepository.save(sellerHolding);
+            }
         }
 
         return true;
